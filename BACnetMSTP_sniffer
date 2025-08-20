@@ -1,36 +1,60 @@
-// BACnet MS/TP Passive Scanner (ESP32)
-// Hardware: ESP32 + 3.3V RS-485 transceiver (e.g., MAX3485)
-// Bus on Serial2 (UART2) so Serial(USB) is free for logs.
-// Keep RE/DE LOW for receive-only.
+// Waveshare ESP32-C6 1.47" Display Dev Board
+// BACnet MS/TP Passive Scanner + On-screen MAC map (1..127)
+// Draws numbers 1..127; highlights seen MACs with a green circle.
+// Shows running error counters beneath the grid.
+//
+// Display: ST7789 172x320 (SPI) using Adafruit_ST7789 + GFX
+// Bus: Serial1 for MS/TP (listen-only), USB Serial for logs
 
 #include <Arduino.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+#include <SPI.h>
 
-// ---------- User settings ----------
-#define BAUD              38400UL   // Set to your MS/TP baud: 9600/19200/38400/76800, etc.
-#define BUS_UART_RX_PIN   16        // RO -> ESP32 RX2
-#define BUS_UART_TX_PIN   17        // DI -> ESP32 TX2 (unused but must be valid)
-#define REDE_PIN          4         // RE+DE tied together; LOW = receive
-#define REPORT_MS         3000
-#define FRAME_TIMEOUT_MS  100
-#define MAX_PAYLOAD       501
+// ---------------- USER OPTIONS ----------------
+#define BAUD                38400UL   // Set to your MS/TP baud (9600/19200/38400/76800 etc.)
+#define REPORT_MS           1000      // Update screen & stats every 1s
+#define FRAME_TIMEOUT_MS    100       // Inter-byte timeout when assembling a frame
+#define MAX_PAYLOAD         501       // MS/TP payload max per spec
 
-// Choose which serial is the bus and which is console
-HardwareSerial& BUS = Serial2;      // MS/TP bus (UART2)
-HardwareSerial& CON = Serial;       // USB console
+// UART pins (ESP32-C6 can remap UART pins freely)
+#define BUS_UART_RX_PIN     16        // RS-485 RO -> here
+#define BUS_UART_TX_PIN     17        // RS-485 DI -> here (unused but must be valid)
+#define REDE_PIN            4         // RS-485 RE/DE tied; keep LOW for receive-only
+
+HardwareSerial& BUS = Serial1;        // MS/TP bus
+HardwareSerial& CON = Serial;         // USB serial for logs
+
+// -------- DISPLAY PINS / OPTIONS (edit to match your board silk) --------
+// Most Waveshare 1.47" (172x320) boards use ST7789 over SPI.
+#define TFT_CS   5
+#define TFT_DC   6
+#define TFT_RST  7
+// If your board uses fixed SPI pins, adjust SCLK/MOSI here (C6 uses GPIO8/10 on some dev boards).
+#define TFT_SCLK 8
+#define TFT_MOSI 10
+
+// Orientation: try 0..3 to taste
+#define TFT_ROTATION 1   // 0/1/2/3
+
+// ---------------- END OF USER OPTIONS ----------------
+
+// ST7789 172x320 constructor (no CS variant also exists; we use CS)
+Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 
 // MS/TP constants
 const uint8_t PREAMBLE0 = 0x55;
 const uint8_t PREAMBLE1 = 0xFF;
 
-// (Subset) Frame types for printouts
-const uint8_t FRAME_TOKEN                = 0x00;
-const uint8_t FRAME_POLL_FOR_MASTER      = 0x01;
-const uint8_t FRAME_REPLY_TO_PFM         = 0x02;
-const uint8_t FRAME_TEST_REQUEST         = 0x03;
-const uint8_t FRAME_TEST_RESPONSE        = 0x04;
-const uint8_t FRAME_DATA_EXPECTING_REPLY = 0x05;
-const uint8_t FRAME_DATA_NO_REPLY        = 0x06;
-const uint8_t FRAME_REPLY_POSTPONED      = 0x07;
+// Frame types (subset for logs)
+const uint8_t FRAME_TOKEN                 = 0x00;
+const uint8_t FRAME_POLL_FOR_MASTER       = 0x01;
+const uint8_t FRAME_REPLY_TO_PFM          = 0x02;
+const uint8_t FRAME_TEST_REQUEST          = 0x03;
+const uint8_t FRAME_TEST_RESPONSE         = 0x04;
+const uint8_t FRAME_DATA_EXPECTING_REPLY  = 0x05;
+const uint8_t FRAME_DATA_NO_REPLY         = 0x06;
+const uint8_t FRAME_REPLY_POSTPONED       = 0x07;
 
 // Stats
 volatile uint32_t stat_bad_preamble = 0;
@@ -40,8 +64,25 @@ volatile uint32_t stat_len_error    = 0;
 volatile uint32_t stat_timeouts     = 0;
 volatile uint32_t stat_frames_ok    = 0;
 
-// Discovered MACs 0..127
+// Discovered MACs 1..127 (we’ll ignore 0 for display purposes)
 bool mac_seen[128] = {false};
+
+// ----- Grid layout (computed at runtime) -----
+struct Cell {
+  int16_t x, y;     // top-left of cell
+  int16_t w, h;
+  int16_t cx, cy;   // center for circle
+};
+static const uint8_t COLS = 8;             // 8 columns
+static const uint8_t ROWS = 16;            // ceil(127/8) = 16 rows
+Cell cells[128];                            // index by address (1..127 valid)
+
+// We’ll reserve bottom area for error counters
+int16_t SCREEN_W = 172;
+int16_t SCREEN_H = 320;
+int16_t ERR_BAR_H = 60;   // pixels reserved at bottom for error counters
+int16_t GRID_H;           // computed: SCREEN_H - ERR_BAR_H
+int16_t CELL_W, CELL_H;
 
 // ---------- CRCs per BACnet MS/TP ----------
 // Header CRC-8: poly 0x31, init 0xFF, final ones-complement
@@ -79,12 +120,105 @@ size_t busReadBytesTimeout(uint8_t* buf, size_t n, uint32_t timeout_ms) {
       if (got >= n) return got;
     }
     if (millis() - start > timeout_ms) break;
-    // yield to keep WiFi/RTOS happy even if not used
     delay(0);
   }
   return got;
 }
 
+// ---- Display helpers ----
+void layoutGrid() {
+  SCREEN_W = tft.width();
+  SCREEN_H = tft.height();
+  GRID_H   = SCREEN_H - ERR_BAR_H;
+
+  CELL_W = SCREEN_W / COLS;
+  CELL_H = GRID_H   / ROWS;
+
+  // Precompute cell rectangles & centers for addresses 1..127
+  for (uint8_t addr = 1; addr <= 127; addr++) {
+    uint8_t idx = addr - 1;
+    uint8_t row = idx / COLS;
+    uint8_t col = idx % COLS;
+
+    Cell &c = cells[addr];
+    c.x  = col * CELL_W;
+    c.y  = row * CELL_H;
+    c.w  = CELL_W;
+    c.h  = CELL_H;
+    c.cx = c.x + c.w / 2;
+    c.cy = c.y + c.h / 2;
+  }
+}
+
+void drawGridNumbers() {
+  tft.fillScreen(ST77XX_BLACK);
+  // Headline
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setTextSize(1);
+
+  // Draw numbers centered in each cell
+  for (uint8_t addr = 1; addr <= 127; addr++) {
+    const Cell &c = cells[addr];
+
+    // Light grid lines (optional)
+    tft.drawRect(c.x, c.y, c.w, c.h, ST77XX_DARKGREY);
+
+    // Center the number
+    char buf[5];
+    snprintf(buf, sizeof(buf), "%u", addr);
+
+    int16_t bx, by; uint16_t bw, bh;
+    tft.getTextBounds(buf, 0, 0, &bx, &by, &bw, &bh);
+    int16_t tx = c.cx - (int)bw/2;
+    int16_t ty = c.cy - (int)bh/2;
+
+    tft.setCursor(tx, ty);
+    tft.print(buf);
+  }
+
+  // Draw footer area separator
+  tft.drawFastHLine(0, GRID_H, SCREEN_W, ST77XX_WHITE);
+}
+
+void drawMacCircle(uint8_t addr) {
+  if (addr < 1 || addr > 127) return;
+  const Cell &c = cells[addr];
+
+  // Circle slightly smaller than cell
+  int16_t r = min(c.w, c.h) / 2 - 3;
+  if (r < 4) r = 4;
+
+  // Outline circle in GREEN
+  tft.drawCircle(c.cx, c.cy, r, ST77XX_GREEN);
+  // Optional thicker circle:
+  tft.drawCircle(c.cx, c.cy, r-1, ST77XX_GREEN);
+}
+
+void clearFooter() {
+  tft.fillRect(0, GRID_H + 1, SCREEN_W, ERR_BAR_H - 1, ST77XX_BLACK);
+}
+
+void drawFooterStats() {
+  clearFooter();
+  tft.setTextColor(ST77XX_YELLOW);
+  tft.setTextSize(1);
+
+  int16_t x = 2, y = GRID_H + 6;
+  auto line = [&](const char* label, uint32_t v) {
+    tft.setCursor(x, y);
+    tft.print(label); tft.print(": "); tft.print(v);
+    y += 12;
+  };
+
+  line("OK",        stat_frames_ok);
+  line("BadPre",    stat_bad_preamble);
+  line("HdrCRC",    stat_hdr_crc_fail);
+  line("DataCRC",   stat_data_crc_fail);
+  line("LenErr",    stat_len_error);
+  line("Timeout",   stat_timeouts);
+}
+
+// ---- Logging (optional) ----
 void printFrameType(uint8_t t) {
   switch (t) {
     case FRAME_TOKEN:                 CON.print(F("TOKEN")); break;
@@ -100,22 +234,30 @@ void printFrameType(uint8_t t) {
 }
 
 void setup() {
+  // RS-485 transceiver in receive-only
   pinMode(REDE_PIN, OUTPUT);
-  digitalWrite(REDE_PIN, LOW);          // listen-only
+  digitalWrite(REDE_PIN, LOW);
 
   // Console
   CON.begin(115200);
   delay(200);
 
-  // MS/TP bus on UART2 (8N1), set RX/TX pins explicitly
+  // Bus UART
   BUS.begin(BAUD, SERIAL_8N1, BUS_UART_RX_PIN, BUS_UART_TX_PIN);
-  // Optional: enlarge RX FIFO a bit (ESP32 default is decent)
   BUS.setRxBufferSize(2048);
 
-  CON.println(F("\nBACnet MS/TP Passive Scanner (ESP32, listen-only)"));
+  // SPI & Display init
+  SPI.begin(TFT_SCLK, /*MISO*/ -1, TFT_MOSI, TFT_CS);
+  tft.init(172, 320);         // ST7789 1.47" is 172x320
+  tft.setRotation(TFT_ROTATION);
+
+  layoutGrid();
+  drawGridNumbers();
+  drawFooterStats();
+
+  CON.println(F("\nBACnet MS/TP Passive Scanner + Display (ESP32-C6)"));
   CON.print(F("Bus baud: ")); CON.println(BAUD);
-  CON.print(F("Bus RX pin: ")); CON.println(BUS_UART_RX_PIN);
-  CON.println(F("Listening for frames..."));
+  CON.println(F("Listening..."));
 }
 
 void loop() {
@@ -131,12 +273,12 @@ void loop() {
       if (BUS.available()) b1 = BUS.read();
 
       if (b1 == PREAMBLE1) {
-        // Read fixed header (5 bytes): frameType, dest, src, lenL, lenH
+        // Fixed header: frameType, dest, src, lenL, lenH
         uint8_t hdr[5];
         size_t got = busReadBytesTimeout(hdr, 5, FRAME_TIMEOUT_MS);
         if (got != 5) { stat_timeouts++; goto REPORT_MAYBE; }
 
-        // Read header CRC (1 byte)
+        // Header CRC
         uint8_t hdr_crc_rx = 0;
         got = busReadBytesTimeout(&hdr_crc_rx, 1, FRAME_TIMEOUT_MS);
         if (got != 1) { stat_timeouts++; goto REPORT_MAYBE; }
@@ -155,7 +297,7 @@ void loop() {
 
         if (len > MAX_PAYLOAD) {
           stat_len_error++;
-          // Drain expected payload+CRC to re-sync
+          // Drain to re-sync
           for (uint32_t i = 0; i < (uint32_t)len + 2; i++) {
             uint32_t t1 = millis();
             while (!BUS.available() && (millis() - t1) < FRAME_TIMEOUT_MS) { delay(0); }
@@ -164,7 +306,7 @@ void loop() {
           goto REPORT_MAYBE;
         }
 
-        // Read payload and data CRC
+        // Payload & Data CRC
         static uint8_t payload[MAX_PAYLOAD];
         if (len > 0) {
           got = busReadBytesTimeout(payload, len, FRAME_TIMEOUT_MS);
@@ -183,9 +325,14 @@ void loop() {
 
         // Valid frame
         stat_frames_ok++;
-        if (src < 128) mac_seen[src] = true;
 
-        // Optional per-frame line
+        // Mark MAC if within 1..127
+        if (src >= 1 && src <= 127 && !mac_seen[src]) {
+          mac_seen[src] = true;
+          drawMacCircle(src); // draw the green circle only once when first seen
+        }
+
+        // Optional serial log
         CON.print(F("[OK] ")); printFrameType(frame_type);
         CON.print(F("  src=")); CON.print(src);
         CON.print(F("  dst=")); CON.print(dest);
@@ -194,32 +341,14 @@ void loop() {
       } else {
         stat_bad_preamble++;
       }
+    } else {
+      // not a preamble start
     }
   }
 
 REPORT_MAYBE:
   if (millis() - last_report >= REPORT_MS) {
     last_report = millis();
-
-    CON.println(F("\n----- BACnet MS/TP Scan Report -----"));
-    CON.print(F("MACs seen: "));
-    bool first = true;
-    for (uint8_t i = 0; i < 128; i++) {
-      if (mac_seen[i]) {
-        if (!first) CON.print(F(", "));
-        CON.print(i);
-        first = false;
-      }
-    }
-    if (first) CON.print(F("(none yet)"));
-    CON.println();
-
-    CON.print(F("Frames OK: "));        CON.println(stat_frames_ok);
-    CON.print(F("Bad preamble: "));     CON.println(stat_bad_preamble);
-    CON.print(F("Header CRC fails: ")); CON.println(stat_hdr_crc_fail);
-    CON.print(F("Data CRC fails: "));   CON.println(stat_data_crc_fail);
-    CON.print(F("Len/Buffer errors: "));CON.println(stat_len_error);
-    CON.print(F("Timeouts: "));         CON.println(stat_timeouts);
-    CON.println(F("------------------------------------"));
+    drawFooterStats(); // live update error/OK counters
   }
 }
