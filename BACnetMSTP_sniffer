@@ -1,0 +1,220 @@
+// BACnet MS/TP Passive Scanner (Listen-only)
+// Hardware: Arduino (e.g., Nano/Uno) + RS-485 transceiver (MAX485/MAX3485)
+// Connect RE and DE tied together to pin REDE_PIN; keep LOW to listen.
+// Set BAUD to match your MS/TP network.
+
+#include <Arduino.h>
+
+#define BAUD        38400UL     // <-- Set to your MS/TP baud (9600/19200/38400/76800 etc.)
+#define REDE_PIN    2           // RE/DE tied together, LOW = receive
+#define REPORT_MS   3000        // How often to print results
+#define FRAME_TIMEOUT_MS 100    // Time to wait for remaining bytes of a frame
+#define MAX_PAYLOAD 501         // MS/TP spec allows up to 501 octets of payload
+
+// MS/TP constants
+const uint8_t PREAMBLE0 = 0x55;
+const uint8_t PREAMBLE1 = 0xFF;
+
+// Frame types (subset, for readability)
+const uint8_t FRAME_TOKEN               = 0x00;
+const uint8_t FRAME_POLL_FOR_MASTER     = 0x01;
+const uint8_t FRAME_REPLY_TO_PFM        = 0x02;
+const uint8_t FRAME_TEST_REQUEST        = 0x03;
+const uint8_t FRAME_TEST_RESPONSE       = 0x04;
+const uint8_t FRAME_DATA_EXPECTING_REPLY= 0x05;
+const uint8_t FRAME_DATA_NO_REPLY       = 0x06;
+const uint8_t FRAME_REPLY_POSTPONED     = 0x07;
+
+// Stats
+volatile uint32_t stat_bad_preamble = 0;
+volatile uint32_t stat_hdr_crc_fail = 0;
+volatile uint32_t stat_data_crc_fail= 0;
+volatile uint32_t stat_len_error    = 0;
+volatile uint32_t stat_timeouts     = 0;
+volatile uint32_t stat_frames_ok    = 0;
+
+// Discovered MACs 0..127
+bool mac_seen[128] = {false};
+
+// ---------- CRCs per BACnet MS/TP ----------
+// Header CRC-8: polynomial 0x31, init 0xFF, final = ones-complement
+uint8_t mstp_crc8(const uint8_t* data, size_t len) {
+  uint8_t crc = 0xFF;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (uint8_t b = 0; b < 8; b++) {
+      if (crc & 0x80) crc = (uint8_t)((crc << 1) ^ 0x31);
+      else            crc <<= 1;
+    }
+  }
+  return (uint8_t)~crc;
+}
+
+// Data CRC-16 (ANSI/IBM): polynomial 0xA001 (reflected), init 0xFFFF, final = ones-complement
+uint16_t mstp_crc16(const uint8_t* data, size_t len) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (uint8_t b = 0; b < 8; b++) {
+      if (crc & 0x0001) crc = (crc >> 1) ^ 0xA001;
+      else              crc >>= 1;
+    }
+  }
+  return (uint16_t)~crc;
+}
+
+// Read exactly n bytes with a simple timeout; returns number actually read
+size_t readBytesWithTimeout(uint8_t* buf, size_t n, uint32_t timeout_ms) {
+  uint32_t start = millis();
+  size_t got = 0;
+  while (got < n) {
+    while (Serial.available()) {
+      buf[got++] = (uint8_t)Serial.read();
+      if (got >= n) return got;
+    }
+    if (millis() - start > timeout_ms) break;
+  }
+  return got;
+}
+
+void printFrameType(uint8_t t) {
+  switch (t) {
+    case FRAME_TOKEN: Serial.print(F("TOKEN")); break;
+    case FRAME_POLL_FOR_MASTER: Serial.print(F("PFM")); break;
+    case FRAME_REPLY_TO_PFM: Serial.print(F("REPLY_TO_PFM")); break;
+    case FRAME_TEST_REQUEST: Serial.print(F("TEST_REQ")); break;
+    case FRAME_TEST_RESPONSE: Serial.print(F("TEST_RESP")); break;
+    case FRAME_DATA_EXPECTING_REPLY: Serial.print(F("DATA+REPLY")); break;
+    case FRAME_DATA_NO_REPLY: Serial.print(F("DATA")); break;
+    case FRAME_REPLY_POSTPONED: Serial.print(F("REPLY_POSTPONED")); break;
+    default: Serial.print(F("TYPE_0x")); Serial.print(t, HEX); break;
+  }
+}
+
+void setup() {
+  pinMode(REDE_PIN, OUTPUT);
+  digitalWrite(REDE_PIN, LOW); // listen-only
+  Serial.begin(BAUD);
+  // Give the port a moment
+  delay(300);
+
+  // Local console at 115200 for status (optional). If your only port is the bus, keep it simple.
+  // For Uno/Nano with one UART, we use the same Serial for bus & console.
+  // If you have a board with extra UART (e.g., Mega/ESP32), use Serial1 for bus and Serial for console.
+
+  Serial.println(F("\nBACnet MS/TP Passive Scanner (listen-only)"));
+  Serial.print(F("Baud: ")); Serial.println(BAUD);
+  Serial.println(F("Listening for frames..."));
+}
+
+void loop() {
+  static uint32_t last_report = 0;
+
+  // Sync to preamble 0x55 0xFF
+  if (Serial.available() >= 2) {
+    int b0 = Serial.read();
+    if (b0 == PREAMBLE0) {
+      int b1 = -1;
+      // wait for next byte with short timeout to maintain sync
+      uint32_t t0 = millis();
+      while (!Serial.available() && (millis() - t0) < FRAME_TIMEOUT_MS) { /* wait */ }
+      if (Serial.available()) b1 = Serial.read();
+
+      if (b1 == PREAMBLE1) {
+        // Read fixed header (5 bytes): frameType, dest, src, lenL, lenH
+        uint8_t hdr[5];
+        size_t got = readBytesWithTimeout(hdr, 5, FRAME_TIMEOUT_MS);
+        if (got != 5) { stat_timeouts++; goto REPORT_MAYBE; }
+
+        // Read header CRC (1 byte)
+        uint8_t hdr_crc_rx = 0;
+        got = readBytesWithTimeout(&hdr_crc_rx, 1, FRAME_TIMEOUT_MS);
+        if (got != 1) { stat_timeouts++; goto REPORT_MAYBE; }
+
+        // Validate header CRC
+        uint8_t hdr_crc_calc = mstp_crc8(hdr, 5);
+        if (hdr_crc_calc != hdr_crc_rx) {
+          stat_hdr_crc_fail++;
+          goto REPORT_MAYBE;
+        }
+
+        uint8_t frame_type = hdr[0];
+        uint8_t dest       = hdr[1];
+        uint8_t src        = hdr[2];
+        uint16_t len       = (uint16_t)hdr[3] | ((uint16_t)hdr[4] << 8);
+
+        if (len > MAX_PAYLOAD) {
+          // Payload exceeds our buffer; consume & count as length error
+          stat_len_error++;
+          // Flush expected bytes (payload + 2 CRC) to re-sync
+          for (uint32_t i = 0; i < (uint32_t)len + 2; i++) {
+            uint32_t t1 = millis();
+            while (!Serial.available() && (millis() - t1) < FRAME_TIMEOUT_MS) { /* wait */ }
+            if (Serial.available()) Serial.read();
+            else { stat_timeouts++; break; }
+          }
+          goto REPORT_MAYBE;
+        }
+
+        // Read payload (len) and data CRC (2)
+        static uint8_t payload[MAX_PAYLOAD];
+        if (len > 0) {
+          got = readBytesWithTimeout(payload, len, FRAME_TIMEOUT_MS);
+          if (got != len) { stat_timeouts++; goto REPORT_MAYBE; }
+        }
+        uint8_t crc16_lohi[2];
+        got = readBytesWithTimeout(crc16_lohi, 2, FRAME_TIMEOUT_MS);
+        if (got != 2) { stat_timeouts++; goto REPORT_MAYBE; }
+
+        uint16_t crc16_rx = (uint16_t)crc16_lohi[0] | ((uint16_t)crc16_lohi[1] << 8);
+        uint16_t crc16_calc = mstp_crc16(payload, len);
+        if (crc16_calc != crc16_rx) {
+          stat_data_crc_fail++;
+          goto REPORT_MAYBE;
+        }
+
+        // Valid frame
+        stat_frames_ok++;
+        if (src < 128) mac_seen[src] = true;
+
+        // Optional: quick line to help while watching
+        Serial.print(F("[OK] ")); printFrameType(frame_type);
+        Serial.print(F("  src=")); Serial.print(src);
+        Serial.print(F("  dst=")); Serial.print(dest);
+        Serial.print(F("  len=")); Serial.println(len);
+
+      } else {
+        stat_bad_preamble++;
+      }
+    } else {
+      // Not start of preamble: ignore
+    }
+  }
+
+REPORT_MAYBE:
+  if (millis() - last_report >= REPORT_MS) {
+    last_report = millis();
+    // Print discovered MACs
+    Serial.println(F("\n----- BACnet MS/TP Scan Report -----"));
+    Serial.print(F("MACs seen: "));
+    bool first = true;
+    for (uint8_t i = 0; i < 128; i++) {
+      if (mac_seen[i]) {
+        if (!first) Serial.print(F(", "));
+        Serial.print(i);
+        first = false;
+      }
+    }
+    if (first) Serial.print(F("(none yet)"));
+    Serial.println();
+
+    // Print stats
+    Serial.print(F("Frames OK: ")); Serial.println(stat_frames_ok);
+    Serial.print(F("Bad preamble: ")); Serial.println(stat_bad_preamble);
+    Serial.print(F("Header CRC fails: ")); Serial.println(stat_hdr_crc_fail);
+    Serial.print(F("Data CRC fails: ")); Serial.println(stat_data_crc_fail);
+    Serial.print(F("Len/Buffer errors: ")); Serial.println(stat_len_error);
+    Serial.print(F("Timeouts: ")); Serial.println(stat_timeouts);
+    Serial.println(F("------------------------------------"));
+  }
+}
