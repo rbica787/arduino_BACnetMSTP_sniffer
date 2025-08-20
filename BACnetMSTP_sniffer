@@ -1,10 +1,10 @@
-// Waveshare ESP32-C6 1.47" Display Dev Board
-// BACnet MS/TP Passive Scanner + On-screen MAC map (1..127)
-// Draws numbers 1..127; highlights seen MACs with a green circle.
-// Shows running error counters beneath the grid.
+// Waveshare ESP32-C6 1.47" Display Dev Board (ST7789 172x320)
+// BACnet MS/TP Passive Scanner + On-screen MAC map (0..127)
+// - Green circle = seen recently (online)
+// - Grey circle  = was seen before but quiet for OFFLINE_MS
+// - No circle    = never seen yet
 //
-// Display: ST7789 172x320 (SPI) using Adafruit_ST7789 + GFX
-// Bus: Serial1 for MS/TP (listen-only), USB Serial for logs
+// Requires: Adafruit GFX, Adafruit ST7735 and ST7789 Library
 
 #include <Arduino.h>
 #include <Adafruit_GFX.h>
@@ -12,10 +12,11 @@
 #include <SPI.h>
 
 // ---------------- USER OPTIONS ----------------
-#define BAUD                38400UL   // Set to your MS/TP baud (9600/19200/38400/76800 etc.)
-#define REPORT_MS           1000      // Update screen & stats every 1s
-#define FRAME_TIMEOUT_MS    100       // Inter-byte timeout when assembling a frame
+#define BAUD                38400UL   // MS/TP baud (9600/19200/38400/76800 etc.)
+#define REPORT_MS           1000      // Update footer & aging check every 1s
+#define FRAME_TIMEOUT_MS    100       // Inter-byte timeout while parsing frames
 #define MAX_PAYLOAD         501       // MS/TP payload max per spec
+#define OFFLINE_MS          10000UL   // If not seen in this many ms -> "grey/offline"
 
 // UART pins (ESP32-C6 can remap UART pins freely)
 #define BUS_UART_RX_PIN     16        // RS-485 RO -> here
@@ -25,330 +26,22 @@
 HardwareSerial& BUS = Serial1;        // MS/TP bus
 HardwareSerial& CON = Serial;         // USB serial for logs
 
-// -------- DISPLAY PINS / OPTIONS (edit to match your board silk) --------
-// Most Waveshare 1.47" (172x320) boards use ST7789 over SPI.
+// -------- DISPLAY PINS / OPTIONS (edit if your board differs) --------
 #define TFT_CS   5
 #define TFT_DC   6
 #define TFT_RST  7
-// If your board uses fixed SPI pins, adjust SCLK/MOSI here (C6 uses GPIO8/10 on some dev boards).
 #define TFT_SCLK 8
 #define TFT_MOSI 10
-
-// Orientation: try 0..3 to taste
 #define TFT_ROTATION 1   // 0/1/2/3
 
-// ---------------- END OF USER OPTIONS ----------------
+// Custom colors (RGB565)
+#define COLOR_GREY   0x8410   // mid grey
+#define COLOR_GRID   0x4208   // dark grey
 
-// ST7789 172x320 constructor (no CS variant also exists; we use CS)
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 
-// MS/TP constants
+// ---------------- BACnet MS/TP bits ----------------
 const uint8_t PREAMBLE0 = 0x55;
 const uint8_t PREAMBLE1 = 0xFF;
 
-// Frame types (subset for logs)
-const uint8_t FRAME_TOKEN                 = 0x00;
-const uint8_t FRAME_POLL_FOR_MASTER       = 0x01;
-const uint8_t FRAME_REPLY_TO_PFM          = 0x02;
-const uint8_t FRAME_TEST_REQUEST          = 0x03;
-const uint8_t FRAME_TEST_RESPONSE         = 0x04;
-const uint8_t FRAME_DATA_EXPECTING_REPLY  = 0x05;
-const uint8_t FRAME_DATA_NO_REPLY         = 0x06;
-const uint8_t FRAME_REPLY_POSTPONED       = 0x07;
-
-// Stats
-volatile uint32_t stat_bad_preamble = 0;
-volatile uint32_t stat_hdr_crc_fail = 0;
-volatile uint32_t stat_data_crc_fail= 0;
-volatile uint32_t stat_len_error    = 0;
-volatile uint32_t stat_timeouts     = 0;
-volatile uint32_t stat_frames_ok    = 0;
-
-// Discovered MACs 1..127 (we’ll ignore 0 for display purposes)
-bool mac_seen[128] = {false};
-
-// ----- Grid layout (computed at runtime) -----
-struct Cell {
-  int16_t x, y;     // top-left of cell
-  int16_t w, h;
-  int16_t cx, cy;   // center for circle
-};
-static const uint8_t COLS = 8;             // 8 columns
-static const uint8_t ROWS = 16;            // ceil(127/8) = 16 rows
-Cell cells[128];                            // index by address (1..127 valid)
-
-// We’ll reserve bottom area for error counters
-int16_t SCREEN_W = 172;
-int16_t SCREEN_H = 320;
-int16_t ERR_BAR_H = 60;   // pixels reserved at bottom for error counters
-int16_t GRID_H;           // computed: SCREEN_H - ERR_BAR_H
-int16_t CELL_W, CELL_H;
-
-// ---------- CRCs per BACnet MS/TP ----------
-// Header CRC-8: poly 0x31, init 0xFF, final ones-complement
-uint8_t mstp_crc8(const uint8_t* data, size_t len) {
-  uint8_t crc = 0xFF;
-  for (size_t i = 0; i < len; i++) {
-    crc ^= data[i];
-    for (uint8_t b = 0; b < 8; b++) {
-      crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x31) : (uint8_t)(crc << 1);
-    }
-  }
-  return (uint8_t)~crc;
-}
-
-// Data CRC-16 (ANSI/IBM): poly 0xA001 (reflected), init 0xFFFF, final ones-complement
-uint16_t mstp_crc16(const uint8_t* data, size_t len) {
-  uint16_t crc = 0xFFFF;
-  for (size_t i = 0; i < len; i++) {
-    crc ^= data[i];
-    for (uint8_t b = 0; b < 8; b++) {
-      if (crc & 0x0001) crc = (crc >> 1) ^ 0xA001;
-      else              crc >>= 1;
-    }
-  }
-  return (uint16_t)~crc;
-}
-
-// Read exactly n bytes from BUS with timeout
-size_t busReadBytesTimeout(uint8_t* buf, size_t n, uint32_t timeout_ms) {
-  uint32_t start = millis();
-  size_t got = 0;
-  while (got < n) {
-    while (BUS.available()) {
-      buf[got++] = (uint8_t)BUS.read();
-      if (got >= n) return got;
-    }
-    if (millis() - start > timeout_ms) break;
-    delay(0);
-  }
-  return got;
-}
-
-// ---- Display helpers ----
-void layoutGrid() {
-  SCREEN_W = tft.width();
-  SCREEN_H = tft.height();
-  GRID_H   = SCREEN_H - ERR_BAR_H;
-
-  CELL_W = SCREEN_W / COLS;
-  CELL_H = GRID_H   / ROWS;
-
-  // Precompute cell rectangles & centers for addresses 1..127
-  for (uint8_t addr = 1; addr <= 127; addr++) {
-    uint8_t idx = addr - 1;
-    uint8_t row = idx / COLS;
-    uint8_t col = idx % COLS;
-
-    Cell &c = cells[addr];
-    c.x  = col * CELL_W;
-    c.y  = row * CELL_H;
-    c.w  = CELL_W;
-    c.h  = CELL_H;
-    c.cx = c.x + c.w / 2;
-    c.cy = c.y + c.h / 2;
-  }
-}
-
-void drawGridNumbers() {
-  tft.fillScreen(ST77XX_BLACK);
-  // Headline
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setTextSize(1);
-
-  // Draw numbers centered in each cell
-  for (uint8_t addr = 1; addr <= 127; addr++) {
-    const Cell &c = cells[addr];
-
-    // Light grid lines (optional)
-    tft.drawRect(c.x, c.y, c.w, c.h, ST77XX_DARKGREY);
-
-    // Center the number
-    char buf[5];
-    snprintf(buf, sizeof(buf), "%u", addr);
-
-    int16_t bx, by; uint16_t bw, bh;
-    tft.getTextBounds(buf, 0, 0, &bx, &by, &bw, &bh);
-    int16_t tx = c.cx - (int)bw/2;
-    int16_t ty = c.cy - (int)bh/2;
-
-    tft.setCursor(tx, ty);
-    tft.print(buf);
-  }
-
-  // Draw footer area separator
-  tft.drawFastHLine(0, GRID_H, SCREEN_W, ST77XX_WHITE);
-}
-
-void drawMacCircle(uint8_t addr) {
-  if (addr < 1 || addr > 127) return;
-  const Cell &c = cells[addr];
-
-  // Circle slightly smaller than cell
-  int16_t r = min(c.w, c.h) / 2 - 3;
-  if (r < 4) r = 4;
-
-  // Outline circle in GREEN
-  tft.drawCircle(c.cx, c.cy, r, ST77XX_GREEN);
-  // Optional thicker circle:
-  tft.drawCircle(c.cx, c.cy, r-1, ST77XX_GREEN);
-}
-
-void clearFooter() {
-  tft.fillRect(0, GRID_H + 1, SCREEN_W, ERR_BAR_H - 1, ST77XX_BLACK);
-}
-
-void drawFooterStats() {
-  clearFooter();
-  tft.setTextColor(ST77XX_YELLOW);
-  tft.setTextSize(1);
-
-  int16_t x = 2, y = GRID_H + 6;
-  auto line = [&](const char* label, uint32_t v) {
-    tft.setCursor(x, y);
-    tft.print(label); tft.print(": "); tft.print(v);
-    y += 12;
-  };
-
-  line("OK",        stat_frames_ok);
-  line("BadPre",    stat_bad_preamble);
-  line("HdrCRC",    stat_hdr_crc_fail);
-  line("DataCRC",   stat_data_crc_fail);
-  line("LenErr",    stat_len_error);
-  line("Timeout",   stat_timeouts);
-}
-
-// ---- Logging (optional) ----
-void printFrameType(uint8_t t) {
-  switch (t) {
-    case FRAME_TOKEN:                 CON.print(F("TOKEN")); break;
-    case FRAME_POLL_FOR_MASTER:       CON.print(F("PFM")); break;
-    case FRAME_REPLY_TO_PFM:          CON.print(F("REPLY_TO_PFM")); break;
-    case FRAME_TEST_REQUEST:          CON.print(F("TEST_REQ")); break;
-    case FRAME_TEST_RESPONSE:         CON.print(F("TEST_RESP")); break;
-    case FRAME_DATA_EXPECTING_REPLY:  CON.print(F("DATA+REPLY")); break;
-    case FRAME_DATA_NO_REPLY:         CON.print(F("DATA")); break;
-    case FRAME_REPLY_POSTPONED:       CON.print(F("REPLY_POSTPONED")); break;
-    default:                          CON.print(F("TYPE_0x")); CON.print(t, HEX); break;
-  }
-}
-
-void setup() {
-  // RS-485 transceiver in receive-only
-  pinMode(REDE_PIN, OUTPUT);
-  digitalWrite(REDE_PIN, LOW);
-
-  // Console
-  CON.begin(115200);
-  delay(200);
-
-  // Bus UART
-  BUS.begin(BAUD, SERIAL_8N1, BUS_UART_RX_PIN, BUS_UART_TX_PIN);
-  BUS.setRxBufferSize(2048);
-
-  // SPI & Display init
-  SPI.begin(TFT_SCLK, /*MISO*/ -1, TFT_MOSI, TFT_CS);
-  tft.init(172, 320);         // ST7789 1.47" is 172x320
-  tft.setRotation(TFT_ROTATION);
-
-  layoutGrid();
-  drawGridNumbers();
-  drawFooterStats();
-
-  CON.println(F("\nBACnet MS/TP Passive Scanner + Display (ESP32-C6)"));
-  CON.print(F("Bus baud: ")); CON.println(BAUD);
-  CON.println(F("Listening..."));
-}
-
-void loop() {
-  static uint32_t last_report = 0;
-
-  // Sync to preamble 0x55 0xFF
-  if (BUS.available() >= 2) {
-    int b0 = BUS.read();
-    if (b0 == PREAMBLE0) {
-      int b1 = -1;
-      uint32_t t0 = millis();
-      while (!BUS.available() && (millis() - t0) < FRAME_TIMEOUT_MS) { delay(0); }
-      if (BUS.available()) b1 = BUS.read();
-
-      if (b1 == PREAMBLE1) {
-        // Fixed header: frameType, dest, src, lenL, lenH
-        uint8_t hdr[5];
-        size_t got = busReadBytesTimeout(hdr, 5, FRAME_TIMEOUT_MS);
-        if (got != 5) { stat_timeouts++; goto REPORT_MAYBE; }
-
-        // Header CRC
-        uint8_t hdr_crc_rx = 0;
-        got = busReadBytesTimeout(&hdr_crc_rx, 1, FRAME_TIMEOUT_MS);
-        if (got != 1) { stat_timeouts++; goto REPORT_MAYBE; }
-
-        // Validate header CRC
-        uint8_t hdr_crc_calc = mstp_crc8(hdr, 5);
-        if (hdr_crc_calc != hdr_crc_rx) {
-          stat_hdr_crc_fail++;
-          goto REPORT_MAYBE;
-        }
-
-        uint8_t frame_type = hdr[0];
-        uint8_t dest       = hdr[1];
-        uint8_t src        = hdr[2];
-        uint16_t len       = (uint16_t)hdr[3] | ((uint16_t)hdr[4] << 8);
-
-        if (len > MAX_PAYLOAD) {
-          stat_len_error++;
-          // Drain to re-sync
-          for (uint32_t i = 0; i < (uint32_t)len + 2; i++) {
-            uint32_t t1 = millis();
-            while (!BUS.available() && (millis() - t1) < FRAME_TIMEOUT_MS) { delay(0); }
-            if (BUS.available()) BUS.read(); else { stat_timeouts++; break; }
-          }
-          goto REPORT_MAYBE;
-        }
-
-        // Payload & Data CRC
-        static uint8_t payload[MAX_PAYLOAD];
-        if (len > 0) {
-          got = busReadBytesTimeout(payload, len, FRAME_TIMEOUT_MS);
-          if (got != len) { stat_timeouts++; goto REPORT_MAYBE; }
-        }
-        uint8_t crc16_lohi[2];
-        got = busReadBytesTimeout(crc16_lohi, 2, FRAME_TIMEOUT_MS);
-        if (got != 2) { stat_timeouts++; goto REPORT_MAYBE; }
-
-        uint16_t crc16_rx = (uint16_t)crc16_lohi[0] | ((uint16_t)crc16_lohi[1] << 8);
-        uint16_t crc16_calc = mstp_crc16(payload, len);
-        if (crc16_calc != crc16_rx) {
-          stat_data_crc_fail++;
-          goto REPORT_MAYBE;
-        }
-
-        // Valid frame
-        stat_frames_ok++;
-
-        // Mark MAC if within 1..127
-        if (src >= 1 && src <= 127 && !mac_seen[src]) {
-          mac_seen[src] = true;
-          drawMacCircle(src); // draw the green circle only once when first seen
-        }
-
-        // Optional serial log
-        CON.print(F("[OK] ")); printFrameType(frame_type);
-        CON.print(F("  src=")); CON.print(src);
-        CON.print(F("  dst=")); CON.print(dest);
-        CON.print(F("  len=")); CON.println(len);
-
-      } else {
-        stat_bad_preamble++;
-      }
-    } else {
-      // not a preamble start
-    }
-  }
-
-REPORT_MAYBE:
-  if (millis() - last_report >= REPORT_MS) {
-    last_report = millis();
-    drawFooterStats(); // live update error/OK counters
-  }
-}
+const uint8_t FRAME_TOKEN
